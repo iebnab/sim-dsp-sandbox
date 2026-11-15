@@ -1,0 +1,11 @@
+{
+  "name": "sim-dsp-dashboard",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Synthetic fixture manifest. Never installed. Versions are deliberately old.",
+  "dependencies": {
+    "express": "4.17.1",
+    "lodash": "4.17.15",
+    "minimist": "1.2.5"
+  }
+}

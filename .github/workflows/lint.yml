@@ -1,0 +1,18 @@
+# Weak CI variant: write-all token and an unpinned third-party action.
+# Manual dispatch only. Synthetic fixture.
+name: lint
+
+on:
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: echo "lint placeholder for the synthetic dashboard"

@@ -24,8 +24,7 @@
 name: publish
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -46,6 +45,7 @@ env:
 
 jobs:
   build:
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -76,6 +76,7 @@ jobs:
           echo "digest-${IMAGE}=${digest}" >> "$GITHUB_OUTPUT"
 
   scan:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -236,6 +237,7 @@ jobs:
             receipt.json
 
   publish:
+    if: github.event_name == 'push'
     needs: [build, scan]
     runs-on: ubuntu-24.04
     environment: release
@@ -353,3 +355,95 @@ jobs:
         run: |
           set -euo pipefail
           cosign copy "${STAGING}/${IMAGE}@${DIGEST}" "${AR_REPOSITORY}/${IMAGE}:${GITHUB_SHA}"
+
+  ecr_completion:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: sim-dsp-bidder
+            digest: sha256:b594998574a73ecfca38933411e83b5bb0daeabac226bf13bf13e8eb92a7745c
+          - image: sim-dsp-tunnel-client
+            digest: sha256:86af7ecfb5be38d58104e78b82f06cee6839cb61b47839d00affbae58a98f5c9
+    env:
+      ECR_REPOSITORY: 342843238294.dkr.ecr.eu-central-1.amazonaws.com/sim-supply-chain
+      SOURCE_RUN: "44780460309"
+    steps:
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cosign with checksum verification
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c -
+          chmod 0755 /usr/local/bin/cosign
+      - name: Load and validate the original source receipt and verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ matrix.digest }}
+        run: |
+          set -euo pipefail
+          gh run download "$SOURCE_RUN" -R "$GITHUB_REPOSITORY" \
+            -n "scan-${IMAGE}" -n "verification-${IMAGE}" -D source-evidence
+          jq -e --arg d "$DIGEST" --arg r "$SOURCE_RUN" \
+            '.image_digest == $d and .run_id == $r and .run_attempt == "1" and .workflow_sha == "7f8e49fac1fec3e0fee2bb3fcaed98418deac46e"' \
+            "source-evidence/scan-${IMAGE}/receipt.json" > /dev/null
+          jq -e --arg d "$DIGEST" \
+            '.image_digest == $d and .signature_verified == true and (.predicate_types | index("https://cosign.sigstore.dev/attestation/vuln/v1") != null and index("https://slsa.dev/provenance/v1") != null)' \
+            "source-evidence/verification-${IMAGE}/verification.json" > /dev/null
+          cp "source-evidence/scan-${IMAGE}/receipt.json" source-receipts.json
+      - name: Exchange fresh GitHub release OIDC for exact ECR publisher
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::342843238294:role/fixture/supply-ci-publisher
+          aws-region: eu-central-1
+          audience: sts.amazonaws.com
+          role-duration-seconds: 900
+      - name: Copy existing signed digest and verify the private ECR destination
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ matrix.digest }}
+        run: |
+          set -euo pipefail
+          identity="https://github.com/iebnab/sim-dsp-sandbox/.github/workflows/publish.yml@refs/heads/main"
+          issuer="https://token.actions.githubusercontent.com"
+          source="${STAGING}/${IMAGE}@${DIGEST}"
+          destination="${ECR_REPOSITORY}@${DIGEST}"
+          cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" --output json "$source" > source-signature.json
+          cosign verify-attestation --type vuln --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" "$source" > source-vuln.jsonl
+          cosign verify-attestation --type slsaprovenance1 --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" "$source" > source-slsa.jsonl
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY%%/*}"
+          cosign copy "$source" "${ECR_REPOSITORY}:${IMAGE}-source-${SOURCE_RUN}"
+          cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" --output json "$destination" > destination-signature.json
+          cosign verify-attestation --type vuln --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" "$destination" > destination-vuln.jsonl
+          cosign verify-attestation --type slsaprovenance1 --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" "$destination" > destination-slsa.jsonl
+          jq -n --arg d "$DIGEST" --arg r "$ECR_REPOSITORY" --arg source_run "$SOURCE_RUN" --arg destination_run "$GITHUB_RUN_ID" \
+            '{image_digest:$d,image_repository:$r,source_run:$source_run,destination_verification_run:$destination_run,signature_verified:true}' > destination-evidence.json
+      - name: Retain original receipt and new destination verification
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ecr-completion-${{ matrix.image }}
+          retention-days: 7
+          path: |
+            source-receipts.json
+            source-signature.json
+            source-vuln.jsonl
+            source-slsa.jsonl
+            destination-signature.json
+            destination-vuln.jsonl
+            destination-slsa.jsonl
+            destination-evidence.json

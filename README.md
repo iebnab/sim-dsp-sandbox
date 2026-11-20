@@ -39,3 +39,13 @@ The original planted bidder/tunnel sources remain unchanged. Their complete
 workflow and sentinel guards are retained byte-for-byte at
 `.github/f11-publish.yml.disabled`, outside GitHub's executable workflow directory.
 The scratch fixture's job mode is `--job`; it has no shell to override.
+
+The bounded ECR completion is a manual dispatch of the same publish workflow,
+not a rebuild or a new scan/signing run. Its fixed matrix copies only the two
+already verified F11 digests from run 44780460309 into the exact private ECR
+repository, using fresh release-environment OIDC. It validates and retains the
+original receipts, verifies both source and destination signature/vulnerability/
+SLSA evidence, and records the new destination execution separately. It uploads
+no new scan or same-execution platform verification assertion. Automatic push
+triggers are disabled during this completion so deploying it cannot rerun the
+full producer. There are no caller-supplied repository, digest or source-run inputs.

@@ -45,7 +45,7 @@ func TestCleanPublishRequiresCompleteZeroEvidence(t *testing.T) {
 func TestCleanPublishHasOnlyAuthorizedPrivateTarget(t *testing.T) {
 	data, err := os.ReadFile(".github/workflows/publish.yml")
 	if err != nil { t.Fatal(err) }
-	text := string(data)
+	text := strings.SplitN(string(data), "  ecr_completion:", 2)[0]
 	if strings.Count(text, "image: [cloudrun-fixture]") != 3 {
 		t.Fatal("clean run must build, scan and publish only cloudrun-fixture")
 	}

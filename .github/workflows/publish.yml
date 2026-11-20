@@ -138,13 +138,17 @@ jobs:
             elif (.Metadata.RepoDigests | type != "array" or index($ref) == null) then error("repository_digest_mismatch")
             elif has("Results") and (.Results | type != "array") then error("results_not_array")
             elif (.Results // [] | all(.[];
-              type == "object" and .Class == "secret" and
+              type == "object" and
+              (.Class as $class | ["os-pkgs", "lang-pkgs", "config", "secret", "license", "license-file", "custom"] | index($class) != null) and
               (.Target | type == "string" and length > 0) and
-              (if has("Secrets") then (.Secrets | type == "array") else true end))) == false then error("result_shape_invalid")
+              (if has("Secrets") then
+                (.Secrets | type == "array") and
+                (if .Class == "secret" then true else (.Secrets | length == 0) end)
+               else true end))) == false then error("result_shape_invalid")
             else true end
           ' secrets-raw.json > /dev/null 2> secret-report-validation.txt
           # Reduce only after validating the complete scanner report and artifact binding.
-          jq '[.Results[]? | .Target as $t | .Secrets[]? |
+          jq '[.Results[]? | select(.Class == "secret") | .Target as $t | .Secrets[]? |
                {target: $t, rule_id: .RuleID, category: .Category, title: .Title,
                 start_line: .StartLine, end_line: .EndLine,
                 layer_digest: (.Layer.Digest // null)}]' secrets-raw.json > secrets.json

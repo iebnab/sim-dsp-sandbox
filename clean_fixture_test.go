@@ -66,7 +66,7 @@ func TestRawSecretEvidenceMustMatchScannedArtifact(t *testing.T) {
 	if start < 0 || end <= start { t.Fatal("raw secret evidence is not validated before reduction") }
 	gate := text[start:end]
 	valid := `{"SchemaVersion":2,"Trivy":{"Version":"0.72.0"},"ArtifactName":"repo@sha256:abc","ArtifactType":"container_image","ArtifactID":"image-id","Metadata":{"ImageID":"sha256:abc","RepoDigests":["repo@sha256:abc"]}}`
-	for _, raw := range []string{`{}`, `null`, `{"Results":null}`, strings.Replace(valid, `"container_image"`, `null`, 1), strings.Replace(valid, `"0.72.0"`, `"0.71.0"`, 1), strings.ReplaceAll(valid, `repo@sha256:abc`, `wrong@sha256:abc`), strings.TrimSuffix(valid, "}")+`,"Results":{}}`, strings.TrimSuffix(valid, "}")+`,"Results":null}`, strings.TrimSuffix(valid, "}")+`,"Results":[{"Target":"/file","Class":"secret","Secrets":null}]}`} {
+	for _, raw := range []string{`{}`, `null`, `{"Results":null}`, strings.Replace(valid, `"container_image"`, `null`, 1), strings.Replace(valid, `"0.72.0"`, `"0.71.0"`, 1), strings.ReplaceAll(valid, `repo@sha256:abc`, `wrong@sha256:abc`), strings.TrimSuffix(valid, "}")+`,"Results":{}}`, strings.TrimSuffix(valid, "}")+`,"Results":null}`, strings.TrimSuffix(valid, "}")+`,"Results":[{"Target":"/file","Class":"secret","Secrets":null}]}`, strings.TrimSuffix(valid, "}")+`,"Results":[{"Target":"/file","Class":"unknown-class"}]}`, strings.TrimSuffix(valid, "}")+`,"Results":[{"Target":"/file","Class":"lang-pkgs","Secrets":{}}]}`} {
 		dir := t.TempDir()
 		if err := os.WriteFile(dir+"/secrets-raw.json", []byte(raw), 0600); err != nil { t.Fatal(err) }
 		cmd := exec.Command("bash", "-euo", "pipefail", "-c", gate)
@@ -74,7 +74,7 @@ func TestRawSecretEvidenceMustMatchScannedArtifact(t *testing.T) {
 		cmd.Env = append(os.Environ(), "ref=repo@sha256:abc")
 		if err := cmd.Run(); err == nil { t.Fatalf("invalid raw report accepted: %s", raw) }
 	}
-	for _, raw := range []string{valid, strings.TrimSuffix(valid, "}")+`,"Results":[]}`, strings.TrimSuffix(valid, "}")+`,"Results":[{"Target":"/file","Class":"secret"}]}`} {
+	for _, raw := range []string{valid, strings.TrimSuffix(valid, "}")+`,"Results":[]}`, strings.TrimSuffix(valid, "}")+`,"Results":[{"Target":"/file","Class":"secret"}]}`, strings.TrimSuffix(valid, "}")+`,"Results":[{"Target":"/fixture-service","Class":"lang-pkgs","Type":"gobinary"}]}`} {
 		dir := t.TempDir()
 		if err := os.WriteFile(dir+"/secrets-raw.json", []byte(raw), 0600); err != nil { t.Fatal(err) }
 		cmd := exec.Command("bash", "-euo", "pipefail", "-c", gate)
@@ -82,6 +82,15 @@ func TestRawSecretEvidenceMustMatchScannedArtifact(t *testing.T) {
 		cmd.Env = append(os.Environ(), "ref=repo@sha256:abc")
 		if output, err := cmd.CombinedOutput(); err != nil { t.Fatalf("legitimate zero report refused: %v %s", err, output) }
 		if reduced, err := os.ReadFile(dir+"/secrets.json"); err != nil || strings.TrimSpace(string(reduced)) != "[]" { t.Fatal("zero report did not reduce to empty results") }
+	}
+	for _, class := range []string{"secret", "lang-pkgs"} {
+		dir := t.TempDir()
+		raw := strings.TrimSuffix(valid, "}")+`,"Results":[{"Target":"/file","Class":"`+class+`","Secrets":[{"RuleID":"fixture-secret","Category":"Test","Title":"Detected","StartLine":1,"EndLine":1}]}]}`
+		if err := os.WriteFile(dir+"/secrets-raw.json", []byte(raw), 0600); err != nil { t.Fatal(err) }
+		cmd := exec.Command("bash", "-euo", "pipefail", "-c", gate+"\njq -e 'length == 0' secrets.json > /dev/null")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "ref=repo@sha256:abc")
+		if err := cmd.Run(); err == nil { t.Fatalf("nonzero %s secret evidence accepted as clean", class) }
 	}
 }
 

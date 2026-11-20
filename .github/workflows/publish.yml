@@ -116,21 +116,33 @@ jobs:
           # This distinct fixture must instead prove complete clean scan evidence.
           # Raw secret evidence validation.
           # Pinned Trivy v0.72.0 report.go omits Results/Secrets only for empty slices.
+          jq --arg ref "$ref" '{
+            expected_artifact: $ref, schema_version: .SchemaVersion,
+            scanner_version: .Trivy.Version, artifact_name: .ArtifactName,
+            artifact_type: .ArtifactType, artifact_id_present: (.ArtifactID | type == "string" and length > 0),
+            image_id_type: (.Metadata.ImageID | type), repo_digests: .Metadata.RepoDigests,
+            results_present: has("Results"), results_type: (.Results | type),
+            result_shapes: [(.Results // [] | if type == "array" then .[] else empty end) |
+              {class: .Class, target_type: (.Target | type), secrets_present: has("Secrets"),
+               secrets_type: (.Secrets | type), secret_count: (.Secrets | if type == "array" then length else null end)}]
+          }' secrets-raw.json > secret-report-diagnostics.json
           jq -e --arg ref "$ref" '
-            type == "object" and .SchemaVersion == 2 and
-            .Trivy.Version == "0.72.0" and .ArtifactName == $ref and
-            .ArtifactType == "container_image" and
-            (.ArtifactID | type == "string" and length > 0) and
-            (.Metadata | type == "object") and
-            (.Metadata.ImageID | type == "string" and startswith("sha256:")) and
-            (.Metadata.RepoDigests | type == "array" and index($ref) != null) and
-            (if has("Results") then
-              (.Results | type == "array" and all(.[];
-                type == "object" and .Class == "secret" and
-                (.Target | type == "string" and length > 0) and
-                (if has("Secrets") then (.Secrets | type == "array") else true end)))
-             else true end)
-          ' secrets-raw.json > /dev/null
+            if type != "object" then error("report_not_object")
+            elif .SchemaVersion != 2 then error("schema_version_mismatch")
+            elif .Trivy.Version != "0.72.0" then error("scanner_version_mismatch")
+            elif .ArtifactName != $ref then error("artifact_name_mismatch")
+            elif .ArtifactType != "container_image" then error("artifact_type_mismatch")
+            elif (.ArtifactID | type != "string" or length == 0) then error("artifact_id_missing")
+            elif (.Metadata | type != "object") then error("metadata_missing")
+            elif (.Metadata.ImageID | type != "string" or startswith("sha256:") == false) then error("image_id_missing")
+            elif (.Metadata.RepoDigests | type != "array" or index($ref) == null) then error("repository_digest_mismatch")
+            elif has("Results") and (.Results | type != "array") then error("results_not_array")
+            elif (.Results // [] | all(.[];
+              type == "object" and .Class == "secret" and
+              (.Target | type == "string" and length > 0) and
+              (if has("Secrets") then (.Secrets | type == "array") else true end))) == false then error("result_shape_invalid")
+            else true end
+          ' secrets-raw.json > /dev/null 2> secret-report-validation.txt
           # Reduce only after validating the complete scanner report and artifact binding.
           jq '[.Results[]? | .Target as $t | .Secrets[]? |
                {target: $t, rule_id: .RuleID, category: .Category, title: .Title,
@@ -204,12 +216,16 @@ jobs:
           echo "scan-${IMAGE}=${scan_id}" >> "$GITHUB_OUTPUT"
           jq -c . accepted.json receipt.json secrets-accepted.json
       - name: Retain reduced scan evidence (never the raw secret report)
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: scan-${{ matrix.image }}
           retention-days: 7
           path: |
             sbom.json
+            secret-report-diagnostics.json
+            secret-report-validation.txt
+            secrets.json
             secrets-upload.json
             accepted.json
             secrets-accepted.json

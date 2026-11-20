@@ -84,3 +84,15 @@ func TestRawSecretEvidenceMustMatchScannedArtifact(t *testing.T) {
 		if reduced, err := os.ReadFile(dir+"/secrets.json"); err != nil || strings.TrimSpace(string(reduced)) != "[]" { t.Fatal("zero report did not reduce to empty results") }
 	}
 }
+
+func TestFailedScanRetainsOnlyValueFreeDiagnostics(t *testing.T) {
+	data, err := os.ReadFile(".github/workflows/publish.yml")
+	if err != nil { t.Fatal(err) }
+	text := string(data)
+	start := strings.Index(text, "- name: Retain reduced scan evidence")
+	if start < 0 { t.Fatal("scan artifact step is missing") }
+	step := strings.SplitN(text[start:], "\n  publish:", 2)[0]
+	if !strings.Contains(step, "if: ${{ always() }}") { t.Fatal("failed scan loses its diagnostics") }
+	if !strings.Contains(step, "secret-report-diagnostics.json") || !strings.Contains(step, "sbom.json") { t.Fatal("failed scan lacks value-free raw report diagnostics") }
+	if strings.Contains(step, "secrets-raw.json") { t.Fatal("raw matched secret values must never be retained") }
+}

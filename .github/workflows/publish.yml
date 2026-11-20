@@ -1,0 +1,276 @@
+# Release chain for the C3 stand-in images (customer workflow, `sim-dsp-app`).
+#
+# Copy of `.github/workflows/publish.yml` in the customer repository. It runs only on a
+# push to `main`, so its OIDC token carries `ref: refs/heads/main` and the workflow_ref
+# the platform registered for it; a pull request cannot reach any job here.
+#
+#   build   -> pushes each image by digest to the staging repository on GHCR
+#   scan    -> pinned Trivy 0.72.0 on <image>@<digest>, uploads the SBOM with its
+#              vulnerability assessment and the image secret results through the CI
+#              ingest principal; the receipt (bound to the digest and this run attempt) is
+#              issued only after the worker assessed the upload, and the job polls for it
+#   publish -> checks the receipt digest equals the build digest, keyless-signs the
+#              digest, attaches the vulnerability attestation and SLSA provenance,
+#              verifies both and uploads the verification result, then copies the image
+#              by digest to Docker Hub
+#
+# The platform's ingest is reachable only over the tailnet (no public ingress), so the
+# `scan` and `publish` jobs join as an ephemeral node tagged `tag:ci` through
+# Tailscale's Action (OAuth client in the TS_OAUTH_CLIENT_ID and TS_OAUTH_SECRET
+# secrets, Tailscale client and tarball sha256 pinned) before they upload.
+#
+# No job carries an `if:`; `publish` needs `scan`, which needs `build`. Every Action is
+# pinned to a full commit SHA; Trivy and cosign are verified by sha256 before they run.
+name: publish
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  STAGING: ghcr.io/${{ github.repository }}
+  RELEASE: docker.io/glasslatchsim
+  INGEST_URL: ${{ vars.INGEST_URL }}
+  INGEST_AUDIENCE: ${{ vars.INGEST_AUDIENCE }}
+  TRIVY_VERSION: "0.72.0"
+  TRIVY_SHA256: bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea
+  COSIGN_VERSION: "v2.6.5"
+  COSIGN_SHA256: c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: [sim-dsp-bidder, sim-dsp-tunnel-client]
+    outputs:
+      digest-sim-dsp-bidder: ${{ steps.push.outputs.digest-sim-dsp-bidder }}
+      digest-sim-dsp-tunnel-client: ${{ steps.push.outputs.digest-sim-dsp-tunnel-client }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          ref="${STAGING}/${IMAGE}:${GITHUB_SHA}"
+          docker build --pull -f "images/${IMAGE}/Dockerfile" -t "$ref" "images/${IMAGE}"
+          docker push "$ref"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)"
+          echo "digest-${IMAGE}=${digest}" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    strategy:
+      matrix:
+        image: [sim-dsp-bidder, sim-dsp-tunnel-client]
+    outputs:
+      receipt-sim-dsp-bidder: ${{ steps.upload.outputs.receipt-sim-dsp-bidder }}
+      receipt-sim-dsp-tunnel-client: ${{ steps.upload.outputs.receipt-sim-dsp-tunnel-client }}
+      scan-sim-dsp-bidder: ${{ steps.upload.outputs.scan-sim-dsp-bidder }}
+      scan-sim-dsp-tunnel-client: ${{ steps.upload.outputs.scan-sim-dsp-tunnel-client }}
+    steps:
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Trivy 0.72.0 (sha256 verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  /tmp/trivy.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+          trivy --version
+      - name: Scan the build digest
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ needs.build.outputs[format('digest-{0}', matrix.image)] }}
+        run: |
+          set -euo pipefail
+          ref="${STAGING}/${IMAGE}@${DIGEST}"
+          trivy image --format cyclonedx --scanners vuln --pkg-types os,library \
+            --output sbom.json "$ref"
+          trivy image --format json --scanners secret --output secrets-raw.json "$ref"
+          # Reduce secret results to the allow-listed fields before anything leaves the
+          # runner: never Match, Code or the image configuration.
+          jq '[.Results[]? | select(.Class == "secret") | .Target as $t | .Secrets[]? |
+               {target: $t, rule_id: .RuleID, category: .Category, title: .Title,
+                start_line: .StartLine, end_line: .EndLine,
+                layer_digest: (.Layer.Digest // null)}]' secrets-raw.json > secrets.json
+          rm secrets-raw.json
+      - name: Join the tailnet as an ephemeral tag:ci node
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: "1.104.4"
+          sha256sum: 624ea093d47d62cf56f17b8332d74b8decda4a1faa610ebc60a1de334b2b3dc9
+      - id: upload
+        name: Upload through the CI ingest principal
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ needs.build.outputs[format('digest-{0}', matrix.image)] }}
+        run: |
+          set -euo pipefail
+          token="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${INGEST_AUDIENCE}" | jq -r .value)"
+          echo "::add-mask::${token}"
+          curl -fsS -o accepted.json -X POST "${INGEST_URL}/api/ingest/ci/sbom" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -H "X-Ingest-Image-Digest: ${DIGEST}" \
+            -H "X-Ingest-Image-Repository: ${STAGING}/${IMAGE}" \
+            -H "X-Ingest-Scope-Layers: all" \
+            -H "X-Ingest-Scope-Package-Types: os,library" \
+            -H "X-Ingest-Complete: true" \
+            -H "X-Ingest-Scanner: trivy" \
+            -H "X-Ingest-Scanner-Version: ${TRIVY_VERSION}" \
+            -H "X-Ingest-Collected-At: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --data-binary @sbom.json
+          scan_id="$(jq -r '.scan_ids[0]' accepted.json)"
+          jq -n --arg s "$scan_id" --arg d "$DIGEST" --slurpfile r secrets.json \
+            '{scan_id: $s, image_digest: $d, results: $r[0]}' > secrets-upload.json
+          curl -fsS -X POST "${INGEST_URL}/api/ingest/ci/secrets" \
+            -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+            --data-binary @secrets-upload.json
+          # The 202 only acknowledges storage. Release authority is the receipt, which
+          # ingest issues once the worker assessed the upload (pinned scanner, the declared
+          # digest, a non-empty inventory, the match); a failed assessment never gets one.
+          receipt_digest=""
+          for _ in $(seq 1 60); do
+            rtoken="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${INGEST_AUDIENCE}" | jq -r .value)"
+            echo "::add-mask::${rtoken}"
+            code="$(curl -sS -o receipt.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${rtoken}" \
+              "${INGEST_URL}/api/ingest/ci/receipt/${scan_id}")"
+            if [ "${code}" = "200" ]; then
+              receipt_digest="$(jq -r '.image_digest' receipt.json)"
+              break
+            fi
+            state="$(jq -r '.detail.state // empty' receipt.json 2>/dev/null || true)"
+            if [ "${code}" != "409" ] || [ "${state}" != "pending" ]; then
+              echo "no receipt for ${DIGEST}: HTTP ${code} state ${state:-none}" >&2
+              break
+            fi
+            sleep 10
+          done
+          echo "receipt-${IMAGE}=${receipt_digest}" >> "$GITHUB_OUTPUT"
+          echo "scan-${IMAGE}=${scan_id}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [build, scan]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      matrix:
+        image: [sim-dsp-bidder, sim-dsp-tunnel-client]
+    steps:
+      - name: Refuse unless the receipt is for the build digest
+        env:
+          DIGEST: ${{ needs.build.outputs[format('digest-{0}', matrix.image)] }}
+          RECEIPT: ${{ needs.scan.outputs[format('receipt-{0}', matrix.image)] }}
+        run: |
+          set -euo pipefail
+          test -n "${DIGEST}"
+          if [ "${RECEIPT}" != "${DIGEST}" ]; then
+            echo "no complete scan receipt for ${DIGEST}" >&2
+            exit 1
+          fi
+      - name: Install Trivy 0.72.0 and cosign (sha256 verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  /tmp/trivy.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+          curl -fsSL -o /usr/local/bin/cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c -
+          chmod 0755 /usr/local/bin/cosign
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Join the tailnet as an ephemeral tag:ci node
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: "1.104.4"
+          sha256sum: 624ea093d47d62cf56f17b8332d74b8decda4a1faa610ebc60a1de334b2b3dc9
+      - name: Sign, attest, verify, upload the verification result, release by digest
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ needs.build.outputs[format('digest-{0}', matrix.image)] }}
+        run: |
+          set -euo pipefail
+          staged="${STAGING}/${IMAGE}@${DIGEST}"
+          identity="https://github.com/${GITHUB_WORKFLOW_REF}"
+          issuer="https://token.actions.githubusercontent.com"
+          cosign sign --yes "$staged"
+          trivy image --format cosign-vuln --scanners vuln --output vuln.json "$staged"
+          cosign attest --yes --type vuln --predicate vuln.json "$staged"
+          jq -n --arg d "${DIGEST#sha256:}" --arg repo "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --arg wf "${GITHUB_WORKFLOW_REF}" --arg sha "${GITHUB_SHA}" --arg run "${GITHUB_RUN_ID}" \
+            '{buildDefinition: {buildType: "https://actions.github.io/buildtypes/workflow/v1",
+               externalParameters: {workflow: $wf}, resolvedDependencies: [{uri: ("git+" + $repo), digest: {gitCommit: $sha}}]},
+              runDetails: {builder: {id: ("https://github.com/" + $wf)}, metadata: {invocationId: $run}}}' \
+            > provenance.json
+          cosign attest --yes --type slsaprovenance1 --predicate provenance.json "$staged"
+          cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            --output json "$staged" > verify.json
+          cosign verify-attestation --type vuln --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" "$staged" > /dev/null
+          cosign verify-attestation --type slsaprovenance1 --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" "$staged" > /dev/null
+          tlog="$(jq -c '[.[].optional.Bundle.Payload.logIndex? // empty | tostring]' verify.json)"
+          jq -n --arg d "$DIGEST" --arg r "${STAGING}/${IMAGE}" --arg v "${COSIGN_VERSION}" \
+            --arg id "$identity" --arg iss "$issuer" --argjson t "$tlog" \
+            '{image_digest: $d, image_repository: $r, verifier: "cosign", verifier_version: $v,
+              mode: "keyless", signer_identity: $id, signer_issuer: $iss,
+              predicate_types: ["https://cosign.sigstore.dev/attestation/vuln/v1", "https://slsa.dev/provenance/v1"],
+              tlog_entry_ids: $t, signature_verified: true}' > verification.json
+          token="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${INGEST_AUDIENCE}" | jq -r .value)"
+          echo "::add-mask::${token}"
+          curl -fsS -X POST "${INGEST_URL}/api/ingest/ci/verification" \
+            -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+            --data-binary @verification.json
+          cosign copy "$staged" "${RELEASE}/${IMAGE}:${GITHUB_SHA}"

@@ -52,10 +52,9 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [sim-dsp-bidder, sim-dsp-tunnel-client]
+        image: [cloudrun-fixture]
     outputs:
-      digest-sim-dsp-bidder: ${{ steps.push.outputs.digest-sim-dsp-bidder }}
-      digest-sim-dsp-tunnel-client: ${{ steps.push.outputs.digest-sim-dsp-tunnel-client }}
+      digest-cloudrun-fixture: ${{ steps.push.outputs.digest-cloudrun-fixture }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -85,12 +84,10 @@ jobs:
       id-token: write
     strategy:
       matrix:
-        image: [sim-dsp-bidder, sim-dsp-tunnel-client]
+        image: [cloudrun-fixture]
     outputs:
-      receipt-sim-dsp-bidder: ${{ steps.upload.outputs.receipt-sim-dsp-bidder }}
-      receipt-sim-dsp-tunnel-client: ${{ steps.upload.outputs.receipt-sim-dsp-tunnel-client }}
-      scan-sim-dsp-bidder: ${{ steps.upload.outputs.scan-sim-dsp-bidder }}
-      scan-sim-dsp-tunnel-client: ${{ steps.upload.outputs.scan-sim-dsp-tunnel-client }}
+      receipt-cloudrun-fixture: ${{ steps.upload.outputs.receipt-cloudrun-fixture }}
+      scan-cloudrun-fixture: ${{ steps.upload.outputs.scan-cloudrun-fixture }}
     steps:
       - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
@@ -115,13 +112,8 @@ jobs:
           trivy image --format cyclonedx --scanners vuln --pkg-types os,library \
             --output sbom.json "$ref"
           trivy image --format json --scanners secret --output secrets-raw.json "$ref"
-          # The synthetic fixture must exist in this exact final image, not a build stage.
-          docker pull "$ref"
-          container="$(docker create "$ref")"
-          docker cp "${container}:/synthetic-credential.json" /tmp/sentinel-present.json
-          docker rm "$container"
-          test -s /tmp/sentinel-present.json
-          rm /tmp/sentinel-present.json
+          # F11 planted-image presence guards remain in the immutable corpus workflow.
+          # This distinct fixture must instead prove complete clean scan evidence.
           # Reduce secret results to the allow-listed fields before anything leaves the
           # runner: never Match, Code or the image configuration.
           jq '[.Results[]? | select(.Class == "secret") | .Target as $t | .Secrets[]? |
@@ -129,7 +121,10 @@ jobs:
                 start_line: .StartLine, end_line: .EndLine,
                 layer_digest: (.Layer.Digest // null)}]' secrets-raw.json > secrets.json
           rm secrets-raw.json
-          jq -e 'any(.[]; .rule_id == "gcp-service-account" and .target == "/synthetic-credential.json")' secrets.json > /dev/null
+          # Clean image evidence gate.
+          jq -e '.bomFormat == "CycloneDX" and (.components | type == "array" and length > 0) and ((.vulnerabilities // []) | type == "array" and length == 0)' sbom.json > /dev/null
+          jq -e 'type == "array" and length == 0' secrets.json > /dev/null
+          # End clean image evidence gate.
       - name: Join the tailnet as an ephemeral tag:ci node
         uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
         with:
@@ -213,7 +208,7 @@ jobs:
       id-token: write
     strategy:
       matrix:
-        image: [sim-dsp-bidder, sim-dsp-tunnel-client]
+        image: [cloudrun-fixture]
     steps:
       - name: Refuse unless the receipt is for the build digest
         env:
@@ -242,11 +237,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
-        with:
-          registry: docker.io
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Join the tailnet as an ephemeral tag:ci node
         uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
         with:
@@ -293,18 +283,6 @@ jobs:
           curl -fsS -o verification-accepted.json -X POST "${INGEST_URL}/api/ingest/ci/verification" \
             -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
             --data-binary @verification.json
-          cosign copy "$staged" "${RELEASE}/${IMAGE}:${GITHUB_SHA}"
-          released="${RELEASE}/${IMAGE}@${DIGEST}"
-          cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
-            --output json "$released" > release-verify.json
-          cosign verify-attestation --type vuln --certificate-identity "$identity" \
-            --certificate-oidc-issuer "$issuer" "$released" > /dev/null
-          cosign verify-attestation --type slsaprovenance1 --certificate-identity "$identity" \
-            --certificate-oidc-issuer "$issuer" "$released" > /dev/null
-          jq --arg r "${RELEASE}/${IMAGE}" '.image_repository = $r' verification.json > release-verification.json
-          curl -fsS -o release-verification-accepted.json -X POST "${INGEST_URL}/api/ingest/ci/verification" \
-            -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
-            --data-binary @release-verification.json
           jq -c . verification-accepted.json
       - name: Retain signed release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -316,9 +294,6 @@ jobs:
             verification-accepted.json
             verify.json
             provenance.json
-            release-verify.json
-            release-verification.json
-            release-verification-accepted.json
       - name: Exchange GitHub OIDC for repository-scoped Artifact Registry access
         id: gcp
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
@@ -341,19 +316,3 @@ jobs:
         run: |
           set -euo pipefail
           cosign copy "${STAGING}/${IMAGE}@${DIGEST}" "${AR_REPOSITORY}/${IMAGE}:${GITHUB_SHA}"
-      - name: Exchange GitHub OIDC for repository-scoped ECR access
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-          audience: sts.amazonaws.com
-          role-duration-seconds: 900
-      - name: Copy the signed scanned digest to private ECR
-        env:
-          IMAGE: ${{ matrix.image }}
-          DIGEST: ${{ needs.build.outputs[format('digest-{0}', matrix.image)] }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-        run: |
-          set -euo pipefail
-          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY%%/*}"
-          cosign copy "${STAGING}/${IMAGE}@${DIGEST}" "${ECR_REPOSITORY}:${IMAGE}-${GITHUB_SHA}"

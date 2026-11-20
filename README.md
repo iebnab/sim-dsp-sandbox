@@ -26,3 +26,16 @@ digest and never changes a default deny policy to allow arbitrary images.
 
 Image build runs the three local Go fixture assertions before compiling the
 static binary. The bidder's inert Log4j jar remains a never-executed KEV witness.
+
+The clean Binary Authorization fixture is distinct: `cloudrun-fixture` uses only
+the pinned static Go binary on scratch, runs as UID/GID 65532, and contains no
+planted credential file or vulnerable base packages. Its publish workflow runs
+only that image and refuses nonzero vulnerability or secret evidence before
+uploading a complete scan. Signing, both attestations, exact receipt matching
+and verification remain mandatory. It copies only to the already authorized
+private Artifact Registry repository; no Docker Hub or ECR target is used.
+
+The original planted bidder/tunnel sources remain unchanged. Their complete
+workflow and sentinel guards are retained byte-for-byte at
+`.github/f11-publish.yml.disabled`, outside GitHub's executable workflow directory.
+The scratch fixture's job mode is `--job`; it has no shell to override.

@@ -9,3 +9,20 @@ It is the weakly protected variant used to test a read-only posture product:
   admins are exempt, and force pushes are allowed;
 - the workflow requests a write-all token and uses an unpinned third-party action,
   and runs only on manual dispatch.
+
+The signed supply-chain fixture images use the main-only publish workflow. The
+sim-dsp-tunnel-client image is a minimal non-root HTTP and batch-job fixture:
+it listens on 0.0.0.0:$PORT (default 8080) and returns constant `ok` for every
+request. `--job` exits successfully without opening a listener. Cloud Run Jobs
+may instead override the command with `/bin/sh -c 'exit 0'`.
+
+It makes no outbound calls and contains no issued credentials. The deliberately
+fake service-account-shaped file is retained only to exercise value-free F11
+secret findings. The workflow scans the immutable build digest, waits for the
+platform receipt, signs and attests it, and verifies signature plus vulnerability
+and SLSA attestations before registry copies. An Artifact Registry copy is not
+destination-side verification; fixture admission uses only the exact verified
+digest and never changes a default deny policy to allow arbitrary images.
+
+Image build runs the three local Go fixture assertions before compiling the
+static binary. The bidder's inert Log4j jar remains a never-executed KEV witness.

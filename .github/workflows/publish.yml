@@ -155,7 +155,7 @@ jobs:
           scan_id="$(jq -r '.scan_ids[0]' accepted.json)"
           jq -n --arg s "$scan_id" --arg d "$DIGEST" --slurpfile r secrets.json \
             '{scan_id: $s, image_digest: $d, results: $r[0]}' > secrets-upload.json
-          curl -fsS -X POST "${INGEST_URL}/api/ingest/ci/secrets" \
+          curl -fsS -o secrets-accepted.json -X POST "${INGEST_URL}/api/ingest/ci/secrets" \
             -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
             --data-binary @secrets-upload.json
           # The 202 only acknowledges storage. Release authority is the receipt, which
@@ -182,6 +182,18 @@ jobs:
           done
           echo "receipt-${IMAGE}=${receipt_digest}" >> "$GITHUB_OUTPUT"
           echo "scan-${IMAGE}=${scan_id}" >> "$GITHUB_OUTPUT"
+          jq -c . accepted.json receipt.json secrets-accepted.json
+      - name: Retain reduced scan evidence (never the raw secret report)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scan-${{ matrix.image }}
+          retention-days: 7
+          path: |
+            sbom.json
+            secrets-upload.json
+            accepted.json
+            secrets-accepted.json
+            receipt.json
 
   publish:
     needs: [build, scan]
@@ -270,7 +282,18 @@ jobs:
           token="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${INGEST_AUDIENCE}" | jq -r .value)"
           echo "::add-mask::${token}"
-          curl -fsS -X POST "${INGEST_URL}/api/ingest/ci/verification" \
+          curl -fsS -o verification-accepted.json -X POST "${INGEST_URL}/api/ingest/ci/verification" \
             -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
             --data-binary @verification.json
           cosign copy "$staged" "${RELEASE}/${IMAGE}:${GITHUB_SHA}"
+          jq -c . verification-accepted.json
+      - name: Retain signed release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verification-${{ matrix.image }}
+          retention-days: 7
+          path: |
+            verification.json
+            verification-accepted.json
+            verify.json
+            provenance.json

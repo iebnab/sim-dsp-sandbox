@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+# Copy to .github/workflows/iac.yml in a declared customer repository.
+# Assesses workflow files only; no cloud credential or Terraform root is needed.
+# INGEST_AUDIENCE must be the audience returned by this workflow's CI registration.
+# Ingest is tailnet-only. The OAuth client creates an ephemeral tag:ci node.
+name: iac
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 */12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iac-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  INGEST_URL: ${{ vars.INGEST_URL }}
+  INGEST_AUDIENCE: ${{ vars.INGEST_AUDIENCE }}
+
+jobs:
+  workflows:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: iebnab/sim-iac-action
+          ref: a5c6a17f3d6433b9d69821735b30352d303812bd # v0.3.0
+          path: .iac-action
+          persist-credentials: false
+      - name: Join the tailnet as an ephemeral tag:ci node
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: "1.104.4"
+          sha256sum: 624ea093d47d62cf56f17b8332d74b8decda4a1faa610ebc60a1de334b2b3dc9
+      - uses: ./.iac-action/deploy/ci-integration/github/iac-action
+        with:
+          class: ci
+          ingest-url: ${{ env.INGEST_URL }}
+          ingest-audience: ${{ env.INGEST_AUDIENCE }}

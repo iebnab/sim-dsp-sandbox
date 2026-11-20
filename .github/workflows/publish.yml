@@ -114,13 +114,30 @@ jobs:
           trivy image --format json --scanners secret --output secrets-raw.json "$ref"
           # F11 planted-image presence guards remain in the immutable corpus workflow.
           # This distinct fixture must instead prove complete clean scan evidence.
-          # Reduce secret results to the allow-listed fields before anything leaves the
-          # runner: never Match, Code or the image configuration.
-          jq '[.Results[]? | select(.Class == "secret") | .Target as $t | .Secrets[]? |
+          # Raw secret evidence validation.
+          # Pinned Trivy v0.72.0 report.go omits Results/Secrets only for empty slices.
+          jq -e --arg ref "$ref" '
+            type == "object" and .SchemaVersion == 2 and
+            .Trivy.Version == "0.72.0" and .ArtifactName == $ref and
+            .ArtifactType == "container_image" and
+            (.ArtifactID | type == "string" and length > 0) and
+            (.Metadata | type == "object") and
+            (.Metadata.ImageID | type == "string" and startswith("sha256:")) and
+            (.Metadata.RepoDigests | type == "array" and index($ref) != null) and
+            (if has("Results") then
+              (.Results | type == "array" and all(.[];
+                type == "object" and .Class == "secret" and
+                (.Target | type == "string" and length > 0) and
+                (if has("Secrets") then (.Secrets | type == "array") else true end)))
+             else true end)
+          ' secrets-raw.json > /dev/null
+          # Reduce only after validating the complete scanner report and artifact binding.
+          jq '[.Results[]? | .Target as $t | .Secrets[]? |
                {target: $t, rule_id: .RuleID, category: .Category, title: .Title,
                 start_line: .StartLine, end_line: .EndLine,
                 layer_digest: (.Layer.Digest // null)}]' secrets-raw.json > secrets.json
           rm secrets-raw.json
+          # End raw secret evidence reduction.
           # Clean image evidence gate.
           jq -e '.bomFormat == "CycloneDX" and (.components | type == "array" and length > 0) and ((.vulnerabilities // []) | type == "array" and length == 0)' sbom.json > /dev/null
           jq -e 'type == "array" and length == 0' secrets.json > /dev/null

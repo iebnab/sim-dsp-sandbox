@@ -115,6 +115,13 @@ jobs:
           trivy image --format cyclonedx --scanners vuln --pkg-types os,library \
             --output sbom.json "$ref"
           trivy image --format json --scanners secret --output secrets-raw.json "$ref"
+          # The synthetic fixture must exist in this exact final image, not a build stage.
+          docker pull "$ref"
+          container="$(docker create "$ref")"
+          docker cp "${container}:/synthetic-credential.json" /tmp/sentinel-present.json
+          docker rm "$container"
+          test -s /tmp/sentinel-present.json
+          rm /tmp/sentinel-present.json
           # Reduce secret results to the allow-listed fields before anything leaves the
           # runner: never Match, Code or the image configuration.
           jq '[.Results[]? | select(.Class == "secret") | .Target as $t | .Secrets[]? |
@@ -122,6 +129,7 @@ jobs:
                 start_line: .StartLine, end_line: .EndLine,
                 layer_digest: (.Layer.Digest // null)}]' secrets-raw.json > secrets.json
           rm secrets-raw.json
+          jq -e 'any(.[]; .rule_id == "gcp-service-account" and .target == "/synthetic-credential.json")' secrets.json > /dev/null
       - name: Join the tailnet as an ephemeral tag:ci node
         uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
         with:
@@ -286,6 +294,17 @@ jobs:
             -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
             --data-binary @verification.json
           cosign copy "$staged" "${RELEASE}/${IMAGE}:${GITHUB_SHA}"
+          released="${RELEASE}/${IMAGE}@${DIGEST}"
+          cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+            --output json "$released" > release-verify.json
+          cosign verify-attestation --type vuln --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" "$released" > /dev/null
+          cosign verify-attestation --type slsaprovenance1 --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" "$released" > /dev/null
+          jq --arg r "${RELEASE}/${IMAGE}" '.image_repository = $r' verification.json > release-verification.json
+          curl -fsS -o release-verification-accepted.json -X POST "${INGEST_URL}/api/ingest/ci/verification" \
+            -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+            --data-binary @release-verification.json
           jq -c . verification-accepted.json
       - name: Retain signed release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -297,6 +316,9 @@ jobs:
             verification-accepted.json
             verify.json
             provenance.json
+            release-verify.json
+            release-verification.json
+            release-verification-accepted.json
       - name: Exchange GitHub OIDC for repository-scoped Artifact Registry access
         id: gcp
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
